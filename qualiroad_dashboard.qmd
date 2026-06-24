@@ -1,0 +1,1005 @@
+---
+title: "Qualiroad – Dashboard d'analyse FireAccess"
+format:
+  dashboard:
+    theme: cosmo
+    orientation: rows
+    scrolling: true
+server: shiny
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r}
+#| context: setup
+#| include: false
+# Packages ---------------------------------------------------------------
+library(shiny)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(gt)
+library(htmltools)
+library(glue)
+library(purrr)
+library(forcats)
+library(readr)
+library(scales)
+library(stringr)
+
+
+
+# Données ----------------------------------------------------------------
+# Le dashboard charge explicitement la donnée depuis un fichier RDS
+# situé dans le même dossier que le .qmd.
+
+data_path <- "donnees_stage_qualiroad.rds"
+
+if (!file.exists(data_path)) {
+  stop(
+    paste0(
+      "Fichier introuvable : ",
+      normalizePath(data_path, winslash = "/", mustWork = FALSE),
+      "\nEnregistre d'abord l'objet avec :",
+      "\nsaveRDS(last_data_qualiroad, 'last_data_qualiroad.rds')"
+    )
+  )
+}
+
+data_raw <- readRDS(data_path)
+
+drop_geom <- function(df) {
+  if (inherits(df, "sf")) {
+    return(sf::st_drop_geometry(df))
+  }
+  sfc_cols <- names(df)[vapply(df, inherits, logical(1), what = "sfc")]
+  if (length(sfc_cols) > 0) {
+    df <- dplyr::select(df, -all_of(sfc_cols))
+  }
+  df
+}
+
+data0 <- drop_geom(data_raw) |> tibble::as_tibble()
+
+# Normalisation légère des classes / types
+chr_cols <- c(
+  "ID_joint", "commune", "Classe_DFCI_BR_mesures_terrain", "Classe_DFCI_PL_mesures_terrain",
+  "Classe_DFCI_FA_Old_param", "Classe_DFCI_FA_New_param", "Classe_DFCI_FA_terrain",
+  "classe_ornierage", "code_insee"
+)
+for (col in intersect(chr_cols, names(data0))) {
+  data0[[col]] <- as.character(data0[[col]])
+}
+
+# Libellés et catalogues -------------------------------------------------
+modele_labels <- c(
+  old = "Modèle 1 – BDTopo + anciens paramètres FireAccess",
+  new = "Modèle 2 – BDTopo + nouveaux paramètres FireAccess",
+  terrain = "Modèle 3 – Levé terrain + nouveaux paramètres FireAccess"
+)
+
+modele_class_field <- c(
+  old = "Classe_DFCI_FA_Old_param",
+  new = "Classe_DFCI_FA_New_param",
+  terrain = "Classe_DFCI_FA_terrain"
+)
+
+# Hypothèse : pour le modèle 3, on utilise bien les champs *_terrain pour PL et BR.
+# (le prompt mentionne une fois erreur_larg_BR_fa_new pour le modèle 3, probablement une coquille)
+modele_error_fields <- list(
+  old = c(PL = "erreur_larg_pl", BR = "erreur_larg_BR"),
+  new = c(PL = "erreur_larg_pl_fa_new", BR = "erreur_larg_BR_fa_new"),
+  terrain = c(PL = "erreur_larg_pl_fa_terrain", BR = "erreur_larg_BR_fa_terrain")
+)
+
+ref_labels <- c(
+  PL = "Validation terrain – Plateforme (PL)",
+  BR = "Validation terrain – Bande de roulement (BR)"
+)
+
+variables_catalogue <- tibble::tribble(
+  ~groupe, ~variable, ~libelle,
+  "Commun", "ecart_bdtopo_centreBR_cm", "Écart (cm) entre coord. BDTopo et le milieu de la bande de roulement",
+  "Commun", "dist_centre_rough_min_cm", "Écart (cm) entre coord. du minimum de rugosité et le milieu de la bande de roulement",
+  "Commun", "dist_centre_density_max_cm", "Écart (cm) entre coord. du maximum de densité de points et le milieu de la bande de roulement",
+  "Commun", "dif_baryc_gps_cm", "Écart (cm) entre barycentre calculé et le milieu de la bande de roulement",
+  "Commun", "ecart_azi_mod_reel_abs", "Écart absolu (°) entre azimut FireAccess et mesure terrain",
+  "Commun", "pente_long", "Pente (%) en long des tronçons",
+  "Commun", "ornierage_cm", "Hauteur (cm) d'orniérage max. relevée sur le terrain",
+  "Commun", "larg_PL_tot_cm", "Largeur terrain de la plateforme (cm)",
+  "Commun", "larg_BR_tot_cm", "Largeur terrain de la bande de roulement (cm)",
+  "Commun", "Moy_pond_densite_point", "Densité moyenne de points le long des transects",
+  "Commun", "Moy_pond_pente_versant", "Pente (%) du versant",
+  "Modèle 1", "larg_fa_cm", "Largeur (cm) issue de FireAccess – anciens paramètres",
+  "Modèle 1", "erreur_larg_pl", "Écart de largeur (cm) plateforme terrain – FireAccess anciens paramètres",
+  "Modèle 1", "erreur_larg_BR", "Écart de largeur (cm) bande de roulement terrain – FireAccess anciens paramètres",
+  "Modèle 2", "larg_fa_new_param_cm", "Largeur (cm) issue de FireAccess – nouveaux paramètres",
+  "Modèle 2", "erreur_larg_pl_fa_new", "Écart de largeur (cm) plateforme terrain – FireAccess nouveaux paramètres",
+  "Modèle 2", "erreur_larg_BR_fa_new", "Écart de largeur (cm) bande de roulement terrain – FireAccess nouveaux paramètres",
+  "Modèle 3", "larg_fa_terrain_cm", "Largeur (cm) issue de FireAccess – levé terrain",
+  "Modèle 3", "erreur_larg_pl_fa_terrain", "Écart de largeur (cm) plateforme terrain – FireAccess terrain",
+  "Modèle 3", "erreur_larg_BR_fa_terrain", "Écart de largeur (cm) bande de roulement terrain – FireAccess terrain"
+)
+
+selected_catalogue <- function(modeles) {
+  keep_groups <- c("Commun")
+  if ("old" %in% modeles) keep_groups <- c(keep_groups, "Modèle 1")
+  if ("new" %in% modeles) keep_groups <- c(keep_groups, "Modèle 2")
+  if ("terrain" %in% modeles) keep_groups <- c(keep_groups, "Modèle 3")
+  variables_catalogue |>
+    filter(groupe %in% keep_groups, variable %in% names(data0))
+}
+
+# Aides UI ---------------------------------------------------------------
+num_range <- function(x, fallback = c(0, 1)) {
+  if (!is.numeric(x)) return(fallback)
+  r <- range(x, na.rm = TRUE)
+  if (any(!is.finite(r))) fallback else r
+}
+
+choices_or_empty <- function(x) {
+  sort(unique(stats::na.omit(as.character(x))))
+}
+
+r_larg_pl <- num_range(data0$larg_PL_tot_cm, c(0, 1000))
+r_larg_br <- num_range(data0$larg_BR_tot_cm, c(0, 500))
+r_densite <- num_range(data0$Moy_pond_densite_point, c(0, 20))
+r_pente <- num_range(data0$Moy_pond_pente_versant, c(0, 60))
+r_orn <- num_range(data0$ornierage_cm, c(0, 50))
+
+choices_classe_pl <- choices_or_empty(data0$Classe_DFCI_PL_mesures_terrain)
+choices_classe_br <- choices_or_empty(data0$Classe_DFCI_BR_mesures_terrain)
+choices_classe_orn <- choices_or_empty(data0$classe_ornierage)
+
+# Fonctions métiers ------------------------------------------------------
+fmt_num <- function(x, digits = 1) {
+  scales::number(x, accuracy = 10^-digits, big.mark = " ", decimal.mark = ",")
+}
+
+make_resume_tbl <- function(df) {
+  tibble::tibble(
+    Indicateur = c(
+      "Nombre de transects (ID_joint uniques)",
+      "Nombre de communes",
+      "Nombre de tronçons (segID uniques)",
+      "Nombre total de lignes filtrées"
+    ),
+    Valeur = c(
+      dplyr::n_distinct(df$ID_joint),
+      dplyr::n_distinct(df$commune),
+      dplyr::n_distinct(df$segID),
+      nrow(df)
+    )
+  )
+}
+
+make_resume_gt <- function(df) {
+  make_resume_tbl(df) |>
+    gt::gt() |>
+    gt::tab_header(
+      title = gt::md("**Tableau récapitulatif**"),
+      subtitle = paste("Filtre actif –", format(Sys.time(), "%d/%m/%Y %H:%M"))
+    ) |>
+    gt::cols_align(columns = everything(), align = "left") |>
+    gt::fmt_number(columns = "Valeur", decimals = 0) |>
+    gt::tab_options(table.width = gt::pct(100))
+}
+
+make_stats_tbl <- function(df, modeles) {
+  cat <- selected_catalogue(modeles)
+  purrr::map_dfr(seq_len(nrow(cat)), function(i) {
+    var <- cat$variable[[i]]
+    x <- suppressWarnings(as.numeric(df[[var]]))
+    x <- x[is.finite(x)]
+    if (!length(x)) return(NULL)
+    tibble::tibble(
+      Groupe = cat$groupe[[i]],
+      Champ = var,
+      Variable = cat$libelle[[i]],
+      Moyenne = mean(x, na.rm = TRUE),
+      Médiane = median(x, na.rm = TRUE),
+      `Écart-type` = stats::sd(x, na.rm = TRUE),
+      Min = min(x, na.rm = TRUE),
+      Max = max(x, na.rm = TRUE)
+    )
+  })
+}
+
+make_stats_gt <- function(df, modeles) {
+  tbl <- make_stats_tbl(df, modeles)
+  if (!nrow(tbl)) {
+    tbl <- tibble::tibble(Message = "Aucune variable numérique disponible après filtrage.")
+    return(gt::gt(tbl))
+  }
+
+  tbl |>
+    gt::gt(groupname_col = "Groupe") |>
+    gt::tab_header(
+      title = gt::md("**Statistiques descriptives**"),
+      subtitle = "Moyenne, médiane, écart-type, min et max"
+    ) |>
+    gt::fmt_number(
+      columns = c("Moyenne", "Médiane", "Écart-type", "Min", "Max"),
+      decimals = 1,
+      use_seps = TRUE
+    ) |>
+    gt::cols_move_to_start(columns = c("Variable", "Champ")) |>
+    gt::cols_label(
+      Variable = "Variable",
+      Champ = "Champ source"
+    ) |>
+    gt::tab_options(table.font.size = px(13), data_row.padding = px(3))
+}
+
+
+make_confusion_df <- function(df, modeles, ref_surface = "PL") {
+
+  ref_var <- if (identical(ref_surface, "BR")) {
+    "Classe_DFCI_BR_mesures_terrain"
+  } else {
+    "Classe_DFCI_PL_mesures_terrain"
+  }
+
+  valid_modeles <- intersect(modeles, names(modele_class_field))
+
+  if (length(valid_modeles) == 0) {
+    return(tibble::tibble(
+      modele = character(),
+      terrain = character(),
+      prediction = character(),
+      n = integer(),
+      freq_norm = numeric()
+    ))
+  }
+
+  purrr::map_dfr(valid_modeles, function(m) {
+
+    pred_var <- unname(modele_class_field[m])
+
+    if (!pred_var %in% names(df) || !ref_var %in% names(df)) {
+      return(tibble::tibble())
+    }
+
+    tibble::tibble(
+      modele = unname(modele_labels[m]),
+      terrain = as.character(df[[ref_var]]),
+      prediction = as.character(df[[pred_var]])
+    ) |>
+      filter(!is.na(terrain), !is.na(prediction), terrain != "", prediction != "")
+  }) |>
+    count(modele, terrain, prediction, name = "n") |>
+    group_by(modele, terrain) |>
+    mutate(freq_norm = n / sum(n)) |>
+    ungroup()
+}
+
+
+plot_confusion_mat <- function(df_conf, ref_surface = "PL") {
+  validate(need(nrow(df_conf) > 0, "Aucune observation disponible pour la matrice de confusion."))
+
+  ggplot(df_conf, aes(x = prediction, y = terrain, fill = freq_norm)) +
+    geom_tile(color = "white", linewidth = 0.4) +
+    geom_text(aes(label = percent(freq_norm, accuracy = 1)), size = 3.5) +
+    facet_wrap(~modele) +
+    scale_fill_gradient(low = "#F7FBFF", high = "#08519C", labels = percent_format(accuracy = 1)) +
+    labs(
+      title = "Matrices de confusion normalisées",
+      subtitle = paste("Normalisation par classe terrain – Référence :", ref_labels[[ref_surface]]),
+      x = "Classe issue du modèle FireAccess",
+      y = "Classe de validation terrain",
+      fill = "Part"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      legend.position = "bottom",
+      axis.text.x = element_text(angle = 30, hjust = 1),
+      panel.grid = element_blank(),
+      strip.text = element_text(face = "bold")
+    )
+}
+
+
+make_error_long <- function(df, modeles) {
+
+  keep_cols <- c(
+    "ID_joint", "Moy_pond_densite_point", "Moy_pond_pente_versant",
+    "ornierage_cm", "classe_ornierage", "commune", "segID"
+  )
+
+  res <- purrr::map_dfr(modeles, function(m) {
+
+    if (!m %in% names(modele_error_fields)) {
+      return(tibble::tibble())
+    }
+
+    err_fields <- modele_error_fields[[m]]
+
+    purrr::imap_dfr(err_fields, function(var_name, surf) {
+
+      if (!var_name %in% names(df)) {
+        return(tibble::tibble())
+      }
+
+      tibble::as_tibble(df[, intersect(c(keep_cols, var_name), names(df)), drop = FALSE]) |>
+        transmute(
+          ID_joint = .data$ID_joint,
+          commune = .data$commune,
+          segID = .data$segID,
+          modele = unname(modele_labels[m]),
+          surface = if (identical(surf, "PL")) "Plateforme (PL)" else "Bande de roulement (BR)",
+          erreur_cm = suppressWarnings(as.numeric(.data[[var_name]])),
+          Moy_pond_densite_point = suppressWarnings(as.numeric(.data$Moy_pond_densite_point)),
+          Moy_pond_pente_versant = suppressWarnings(as.numeric(.data$Moy_pond_pente_versant)),
+          ornierage_cm = suppressWarnings(as.numeric(.data$ornierage_cm)),
+          classe_ornierage = as.character(.data$classe_ornierage)
+        )
+    })
+  })
+
+  if (nrow(res) == 0 || !"erreur_cm" %in% names(res)) {
+    return(tibble::tibble(
+      ID_joint = character(),
+      commune = character(),
+      segID = numeric(),
+      modele = character(),
+      surface = character(),
+      erreur_cm = numeric(),
+      Moy_pond_densite_point = numeric(),
+      Moy_pond_pente_versant = numeric(),
+      ornierage_cm = numeric(),
+      classe_ornierage = character()
+    ))
+  }
+
+  res |>
+    filter(is.finite(erreur_cm))
+}
+
+
+prep_box_lm_data <- function(df, var, breaks, labels, mids) {
+  out <- df |>
+    filter(is.finite(.data[[var]]), is.finite(erreur_cm)) |>
+    mutate(
+      classe = cut(.data[[var]], breaks = breaks, labels = labels, include.lowest = TRUE, right = FALSE),
+      classe = fct_drop(classe),
+      bin_mid = mids[as.character(classe)]
+    ) |>
+    filter(!is.na(classe), !is.na(bin_mid))
+  out
+}
+
+plot_influence_surface <- function(df_long, surface_label, variable, breaks, labels, mids, titre, xlab) {
+  dat <- prep_box_lm_data(df_long |> filter(surface == surface_label), variable, breaks, labels, mids)
+  validate(need(nrow(dat) > 0, paste("Aucune donnée disponible pour", surface_label, "après filtrage.")))
+
+  width_guess <- diff(sort(unique(unname(mids))))
+  width_guess <- ifelse(length(width_guess) > 0, min(width_guess) * 0.7, 2)
+
+  ggplot(dat, aes(y = erreur_cm)) +
+    geom_hline(yintercept = 0, linetype = 2, color = "grey40") +
+    geom_boxplot(
+      aes(x = bin_mid, group = classe),
+      width = width_guess,
+      fill = "#9ecae1",
+      color = "#3182bd",
+      alpha = 0.65,
+      outlier.shape = NA
+    ) +
+    geom_jitter(
+      aes(x = bin_mid),
+      width = width_guess * 0.12,
+      alpha = 0.35,
+      size = 1.6,
+      color = "#08519c"
+    ) +
+    geom_smooth(
+      aes(x = .data[[variable]], y = erreur_cm),
+      method = "lm",
+      se = FALSE,
+      color = "#cb181d",
+      linewidth = 0.9
+    ) +
+    facet_wrap(~modele, ncol = 1, scales = "free_y") +
+    scale_x_continuous(breaks = unname(mids), labels = names(mids)) +
+    labs(
+      title = titre,
+      subtitle = surface_label,
+      x = xlab,
+      y = "Erreur de largeur (cm)"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      strip.text = element_text(face = "bold"),
+      panel.grid.minor = element_blank()
+    )
+}
+
+plot_hist_metric <- function(df, var, titre, xlab) {
+  validate(need(var %in% names(df), paste("Champ introuvable :", var)))
+  x <- df[[var]]
+  x <- x[is.finite(x)]
+  validate(need(length(x) > 0, paste("Aucune donnée disponible pour", var)))
+
+  avg <- mean(x, na.rm = TRUE)
+  med <- median(x, na.rm = TRUE)
+
+  ggplot(tibble::tibble(val = x), aes(x = val)) +
+    geom_histogram(bins = 30, fill = "#6baed6", color = "white", alpha = 0.9) +
+    geom_vline(xintercept = avg, color = "#cb181d", linewidth = 1) +
+    geom_vline(xintercept = med, color = "#08519c", linewidth = 1, linetype = 2) +
+    annotate("label", x = avg, y = Inf, label = paste0("Moyenne = ", fmt_num(avg, 1)), vjust = 1.5,
+             color = "#cb181d", fill = alpha("white", 0.8), linewidth = 0.2) +
+    annotate("label", x = med, y = Inf, label = paste0("Médiane = ", fmt_num(med, 1)), vjust = 3.4,
+             color = "#08519c", fill = alpha("white", 0.8), linewidth = 0.2) +
+    labs(title = titre, x = xlab, y = "Effectif") +
+    theme_minimal(base_size = 12)
+}
+
+save_plot_png <- function(plot_obj, filename, width = 10, height = 6, dpi = 160) {
+  ggplot2::ggsave(filename = filename, plot = plot_obj, width = width, height = height, units = "in", dpi = dpi)
+}
+
+build_pdf_export <- function(df_filtered, modeles, ref_surface, output_file) {
+  if (!requireNamespace("pagedown", quietly = TRUE)) {
+    stop("Le package 'pagedown' doit être installé pour l'export PDF.")
+  }
+
+  tmpdir <- tempfile("qualiroad_pdf_")
+  dir.create(tmpdir, recursive = TRUE)
+
+  # Tables
+  resume_gt <- make_resume_gt(df_filtered)
+  stats_gt <- make_stats_gt(df_filtered, modeles)
+
+  # Figures
+  figs <- list()
+
+  if (length(modeles) > 0) {
+    conf_df <- make_confusion_df(df_filtered, modeles = modeles, ref_surface = ref_surface)
+    conf_plot <- plot_confusion_mat(conf_df, ref_surface = ref_surface)
+    figs$confusion <- file.path(tmpdir, "confusion.png")
+    save_plot_png(conf_plot, figs$confusion, width = 12, height = 7)
+
+    err_long <- make_error_long(df_filtered, modeles)
+
+    dens_breaks <- c(-Inf, 5, 10, Inf)
+    dens_labels <- c("0–5", "5–10", "> 10")
+    dens_mids <- c("0–5" = 2.5, "5–10" = 7.5, "> 10" = 12.5)
+
+    pente_breaks <- c(-Inf, 10, 20, Inf)
+    pente_labels <- c("0–10", "10–20", "> 20")
+    pente_mids <- c("0–10" = 5, "10–20" = 15, "> 20" = 25)
+
+    orn_breaks <- c(-Inf, 5, 10, 15, 20, Inf)
+    orn_labels <- c("0–5", "5–10", "10–15", "15–20", "> 20")
+    orn_mids <- c("0–5" = 2.5, "5–10" = 7.5, "10–15" = 12.5, "15–20" = 17.5, "> 20" = 22.5)
+
+    p_dens_pl <- plot_influence_surface(err_long, "Plateforme (PL)", "Moy_pond_densite_point", dens_breaks, dens_labels, dens_mids,
+                                        "Influence de la densité de points sol", "Classes de densité moyenne de points")
+    p_dens_br <- plot_influence_surface(err_long, "Bande de roulement (BR)", "Moy_pond_densite_point", dens_breaks, dens_labels, dens_mids,
+                                        "Influence de la densité de points sol", "Classes de densité moyenne de points")
+    p_pente_pl <- plot_influence_surface(err_long, "Plateforme (PL)", "Moy_pond_pente_versant", pente_breaks, pente_labels, pente_mids,
+                                         "Influence de la pente du versant", "Classes de pente du versant (%)")
+    p_pente_br <- plot_influence_surface(err_long, "Bande de roulement (BR)", "Moy_pond_pente_versant", pente_breaks, pente_labels, pente_mids,
+                                         "Influence de la pente du versant", "Classes de pente du versant (%)")
+    p_orn_pl <- plot_influence_surface(err_long, "Plateforme (PL)", "ornierage_cm", orn_breaks, orn_labels, orn_mids,
+                                       "Influence de l'orniérage", "Classes d'orniérage (cm)")
+    p_orn_br <- plot_influence_surface(err_long, "Bande de roulement (BR)", "ornierage_cm", orn_breaks, orn_labels, orn_mids,
+                                       "Influence de l'orniérage", "Classes d'orniérage (cm)")
+
+    figs$dens_pl <- file.path(tmpdir, "densite_pl.png")
+    figs$dens_br <- file.path(tmpdir, "densite_br.png")
+    figs$pente_pl <- file.path(tmpdir, "pente_pl.png")
+    figs$pente_br <- file.path(tmpdir, "pente_br.png")
+    figs$orn_pl <- file.path(tmpdir, "orn_pl.png")
+    figs$orn_br <- file.path(tmpdir, "orn_br.png")
+
+    save_plot_png(p_dens_pl, figs$dens_pl, width = 10, height = 8)
+    save_plot_png(p_dens_br, figs$dens_br, width = 10, height = 8)
+    save_plot_png(p_pente_pl, figs$pente_pl, width = 10, height = 8)
+    save_plot_png(p_pente_br, figs$pente_br, width = 10, height = 8)
+    save_plot_png(p_orn_pl, figs$orn_pl, width = 10, height = 10)
+    save_plot_png(p_orn_br, figs$orn_br, width = 10, height = 10)
+  }
+
+  p_hist1 <- plot_hist_metric(
+    df_filtered,
+    "ecart_bdtopo_centreBR_cm",
+    "Répartition des écarts entre la BDTopo et le centre de la bande de roulement",
+    "Écart BDTopo ↔ centre BR (cm)"
+  )
+  p_hist2 <- plot_hist_metric(
+    df_filtered,
+    "Ecart_distbaryc_terrain_vs_gps_cm",
+    "Répartition des écarts entre barycentre calculé et centre de la bande de roulement",
+    "Écart barycentre ↔ centre BR (cm)"
+  )
+
+  figs$hist1 <- file.path(tmpdir, "hist_bdtopo.png")
+  figs$hist2 <- file.path(tmpdir, "hist_barycentre.png")
+  save_plot_png(p_hist1, figs$hist1, width = 10, height = 5.5)
+  save_plot_png(p_hist2, figs$hist2, width = 10, height = 5.5)
+
+  report_html <- tags$html(
+    tags$head(
+      tags$meta(charset = "utf-8"),
+      tags$title("Qualiroad – Rapport PDF"),
+      tags$style(HTML(
+        "
+        @page { size: A4 landscape; margin: 12mm; }
+        body { font-family: Arial, Helvetica, sans-serif; color: #1f2937; }
+        h1, h2, h3 { color: #0f172a; margin-bottom: 0.25rem; }
+        .muted { color: #475569; font-size: 0.92rem; margin-bottom: 1rem; }
+        .section { margin-bottom: 26px; page-break-inside: avoid; }
+        .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; align-items: start; }
+        .figure { margin: 8px 0 16px 0; }
+        .figure img { width: 100%; height: auto; border: 1px solid #e5e7eb; }
+        .caption { font-size: 0.9rem; color: #475569; margin-top: 4px; }
+        .small { font-size: 0.88rem; color: #475569; }
+        .hr { border-top: 1px solid #cbd5e1; margin: 12px 0 18px 0; }
+        "
+      ))
+    ),
+    tags$body(
+      tags$h1("Qualiroad – Rapport d'analyse FireAccess"),
+      tags$div(class = "muted",
+               glue("Généré le {format(Sys.time(), '%d/%m/%Y à %H:%M')} – modèles sélectionnés : {if (length(modeles)) paste(modele_labels[modeles], collapse = ' | ') else 'aucun'} – référence confusion : {ref_labels[[ref_surface]]}")),
+
+      tags$div(class = "section",
+               tags$h2("1. Synthèse"),
+               HTML(gt::as_raw_html(resume_gt)),
+               tags$div(class = "hr"),
+               HTML(gt::as_raw_html(stats_gt))
+      ),
+
+      if (length(modeles) > 0) tags$div(class = "section",
+               tags$h2("2. Matrices de confusion"),
+               tags$div(class = "figure",
+                        tags$img(src = basename(figs$confusion)),
+                        tags$div(class = "caption", "Matrices de confusion normalisées, facettées par modèle sélectionné."))
+      ),
+
+      if (length(modeles) > 0) tags$div(class = "section",
+               tags$h2("3. Influence de la densité de points"),
+               tags$div(class = "grid2",
+                        tags$div(class = "figure", tags$img(src = basename(figs$dens_pl)), tags$div(class = "caption", "Plateforme (PL)")),
+                        tags$div(class = "figure", tags$img(src = basename(figs$dens_br)), tags$div(class = "caption", "Bande de roulement (BR)")))
+      ),
+
+      if (length(modeles) > 0) tags$div(class = "section",
+               tags$h2("4. Influence de la pente du versant"),
+               tags$div(class = "grid2",
+                        tags$div(class = "figure", tags$img(src = basename(figs$pente_pl)), tags$div(class = "caption", "Plateforme (PL)")),
+                        tags$div(class = "figure", tags$img(src = basename(figs$pente_br)), tags$div(class = "caption", "Bande de roulement (BR)")))
+      ),
+
+      if (length(modeles) > 0) tags$div(class = "section",
+               tags$h2("5. Influence de l'orniérage"),
+               tags$div(class = "grid2",
+                        tags$div(class = "figure", tags$img(src = basename(figs$orn_pl)), tags$div(class = "caption", "Plateforme (PL)")),
+                        tags$div(class = "figure", tags$img(src = basename(figs$orn_br)), tags$div(class = "caption", "Bande de roulement (BR)")))
+      ),
+
+      tags$div(class = "section",
+               tags$h2("6. Distributions indépendantes du modèle"),
+               tags$div(class = "grid2",
+                        tags$div(class = "figure", tags$img(src = basename(figs$hist1))),
+                        tags$div(class = "figure", tags$img(src = basename(figs$hist2))))
+      ),
+
+      tags$p(class = "small", "Note : l'export PDF repose sur pagedown::chrome_print() et nécessite Google Chrome, Microsoft Edge ou Chromium sur le serveur d'exécution.")
+    )
+  )
+
+  index_file <- file.path(tmpdir, "index.html")
+  htmltools::save_html(report_html, file = index_file, background = "white")
+
+  oldwd <- getwd()
+  on.exit(setwd(oldwd), add = TRUE)
+  setwd(tmpdir)
+
+  pagedown::chrome_print(
+    input = index_file,
+    output = output_file,
+    wait = 2,
+    extra_args = c("--disable-gpu", "--no-sandbox")
+  )
+}
+```
+
+```{=html}
+<style>
+.card-title {
+  font-weight: 700;
+}
+.quarto-dashboard-content .tab-content {
+  padding-top: 0.4rem;
+}
+</style>
+```
+
+##  {.sidebar}
+
+### Paramètres d'analyse
+
+```{r}
+
+modele_choices <- list(
+  "Modèle 1 – BDTopo + anciens paramètres FireAccess" = "old",
+  "Modèle 2 – BDTopo + nouveaux paramètres FireAccess" = "new",
+  "Modèle 3 – Levé terrain + nouveaux paramètres FireAccess" = "terrain"
+)
+
+checkboxGroupInput(
+  inputId = "modeles",
+  label = "Modèles à représenter",
+  choices = modele_choices,
+  selected = c("old", "new", "terrain")
+)
+
+
+
+radioButtons(
+  inputId = "type_ref",
+  label = "Référence terrain pour les matrices de confusion",
+  choices = list(
+    "Plateforme (PL)" = "PL",
+    "Bande de roulement (BR)" = "BR"
+  ),
+  selected = "PL",
+  inline = FALSE
+)
+
+
+hr()
+```
+
+### Filtres numériques
+
+```{r}
+sliderInput(
+  inputId = "f_larg_pl",
+  label = "Largeur plateforme – larg_PL_tot_cm (cm)",
+  min = floor(r_larg_pl[1]), max = ceiling(r_larg_pl[2]),
+  value = c(floor(r_larg_pl[1]), ceiling(r_larg_pl[2]))
+)
+
+sliderInput(
+  inputId = "f_larg_br",
+  label = "Largeur bande de roulement – larg_BR_tot_cm (cm)",
+  min = floor(r_larg_br[1]), max = ceiling(r_larg_br[2]),
+  value = c(floor(r_larg_br[1]), ceiling(r_larg_br[2]))
+)
+
+sliderInput(
+  inputId = "f_densite",
+  label = "Densité de points sol – Moy_pond_densite_point",
+  min = floor(r_densite[1]), max = ceiling(r_densite[2]),
+  value = c(floor(r_densite[1]), ceiling(r_densite[2]))
+)
+
+sliderInput(
+  inputId = "f_pente_versant",
+  label = "Pente du versant – Moy_pond_pente_versant (%)",
+  min = floor(r_pente[1]), max = ceiling(r_pente[2]),
+  value = c(floor(r_pente[1]), ceiling(r_pente[2]))
+)
+
+sliderInput(
+  inputId = "f_ornierage",
+  label = "Orniérage – ornierage_cm (cm)",
+  min = floor(r_orn[1]), max = ceiling(r_orn[2]),
+  value = c(floor(r_orn[1]), ceiling(r_orn[2]))
+)
+```
+
+### Filtres catégoriels
+
+```{r}
+selectizeInput(
+  inputId = "f_classe_pl",
+  label = "Classe DFCI terrain – plateforme",
+  choices = choices_classe_pl,
+  selected = choices_classe_pl,
+  multiple = TRUE,
+  options = list(plugins = list('remove_button'))
+)
+
+selectizeInput(
+  inputId = "f_classe_br",
+  label = "Classe DFCI terrain – bande de roulement",
+  choices = choices_classe_br,
+  selected = choices_classe_br,
+  multiple = TRUE,
+  options = list(plugins = list('remove_button'))
+)
+
+selectizeInput(
+  inputId = "f_classe_orn",
+  label = "Classe d'orniérage",
+  choices = choices_classe_orn,
+  selected = choices_classe_orn,
+  multiple = TRUE,
+  options = list(plugins = list('remove_button'))
+)
+
+hr()
+downloadButton("download_pdf", "Exporter le PDF (pagedown)", class = "btn-primary")
+helpText("L'export PDF reprend les résultats affichés sous une mise en page imprimable.")
+```
+
+## Synthèse
+
+### Tableau récapitulatif
+
+```{r}
+gt_output("resume_gt")
+```
+
+### Statistiques descriptives
+
+```{r}
+gt_output("stats_gt")
+```
+
+## Matrices de confusion
+
+### Normalisation par classe terrain
+
+```{r}
+plotOutput("confusion_plot", height = "720px")
+```
+
+## Influences
+
+### Densité de points — Plateforme (PL)
+
+```{r}
+plotOutput("densite_pl_plot", height = "860px")
+```
+
+### Densité de points — Bande de roulement (BR)
+
+```{r}
+plotOutput("densite_br_plot", height = "860px")
+```
+
+### Pente du versant — Plateforme (PL)
+
+```{r}
+plotOutput("pente_pl_plot", height = "860px")
+```
+
+### Pente du versant — Bande de roulement (BR)
+
+```{r}
+plotOutput("pente_br_plot", height = "860px")
+```
+
+### Orniérage — Plateforme (PL)
+
+```{r}
+plotOutput("orn_pl_plot", height = "980px")
+```
+
+### Orniérage — Bande de roulement (BR)
+
+```{r}
+plotOutput("orn_br_plot", height = "980px")
+```
+
+## Distributions indépendantes du modèle
+
+### Écart BDTopo ↔ centre de la bande de roulement
+
+```{r}
+plotOutput("hist_bdtopo_plot", height = "460px")
+```
+
+### Écart barycentre ↔ centre de la bande de roulement
+
+```{r}
+plotOutput("hist_bary_plot", height = "460px")
+```
+
+```{r}
+#| context: server
+
+filtered_data <- reactive({
+  df <- data0
+
+  # Filtres numériques
+  df <- df |>
+    filter(
+      is.na(larg_PL_tot_cm) | between(larg_PL_tot_cm, input$f_larg_pl[1], input$f_larg_pl[2]),
+      is.na(larg_BR_tot_cm) | between(larg_BR_tot_cm, input$f_larg_br[1], input$f_larg_br[2]),
+      is.na(Moy_pond_densite_point) | between(Moy_pond_densite_point, input$f_densite[1], input$f_densite[2]),
+      is.na(Moy_pond_pente_versant) | between(Moy_pond_pente_versant, input$f_pente_versant[1], input$f_pente_versant[2]),
+      is.na(ornierage_cm) | between(ornierage_cm, input$f_ornierage[1], input$f_ornierage[2])
+    )
+
+  # Filtres catégoriels
+  if (length(input$f_classe_pl) > 0 && "Classe_DFCI_PL_mesures_terrain" %in% names(df)) {
+    df <- df |> filter(is.na(Classe_DFCI_PL_mesures_terrain) | Classe_DFCI_PL_mesures_terrain %in% input$f_classe_pl)
+  }
+  if (length(input$f_classe_br) > 0 && "Classe_DFCI_BR_mesures_terrain" %in% names(df)) {
+    df <- df |> filter(is.na(Classe_DFCI_BR_mesures_terrain) | Classe_DFCI_BR_mesures_terrain %in% input$f_classe_br)
+  }
+  if (length(input$f_classe_orn) > 0 && "classe_ornierage" %in% names(df)) {
+    df <- df |> filter(is.na(classe_ornierage) | classe_ornierage %in% input$f_classe_orn)
+  }
+
+  df
+})
+
+error_long <- reactive({
+  req(length(input$modeles) > 0)
+  make_error_long(filtered_data(), input$modeles)
+})
+
+# Tables -----------------------------------------------------------------
+output$resume_gt <- gt::render_gt({
+  df <- filtered_data()
+  validate(need(nrow(df) > 0, "Aucune donnée disponible après filtrage."))
+  make_resume_gt(df)
+})
+
+output$stats_gt <- gt::render_gt({
+  df <- filtered_data()
+  validate(need(nrow(df) > 0, "Aucune donnée disponible après filtrage."))
+  make_stats_gt(df, input$modeles)
+})
+
+# Confusion --------------------------------------------------------------
+output$confusion_plot <- renderPlot({
+  validate(need(length(input$modeles) > 0, "Sélectionnez au moins un modèle."))
+  conf_df <- make_confusion_df(filtered_data(), modeles = input$modeles, ref_surface = input$type_ref)
+  plot_confusion_mat(conf_df, ref_surface = input$type_ref)
+}, res = 120)
+
+# Influences -------------------------------------------------------------
+dens_breaks <- c(-Inf, 5, 10, Inf)
+dens_labels <- c("0–5", "5–10", "> 10")
+dens_mids <- c("0–5" = 2.5, "5–10" = 7.5, "> 10" = 12.5)
+
+pente_breaks <- c(-Inf, 10, 20, Inf)
+pente_labels <- c("0–10", "10–20", "> 20")
+pente_mids <- c("0–10" = 5, "10–20" = 15, "> 20" = 25)
+
+orn_breaks <- c(-Inf, 5, 10, 15, 20, Inf)
+orn_labels <- c("0–5", "5–10", "10–15", "15–20", "> 20")
+orn_mids <- c("0–5" = 2.5, "5–10" = 7.5, "10–15" = 12.5, "15–20" = 17.5, "> 20" = 22.5)
+
+output$densite_pl_plot <- renderPlot({
+  validate(need(length(input$modeles) > 0, "Sélectionnez au moins un modèle."))
+  plot_influence_surface(
+    error_long(),
+    surface_label = "Plateforme (PL)",
+    variable = "Moy_pond_densite_point",
+    breaks = dens_breaks,
+    labels = dens_labels,
+    mids = dens_mids,
+    titre = "Influence de la densité de points sol sur l'erreur de largeur",
+    xlab = "Classes de densité moyenne de points"
+  )
+}, res = 120)
+
+output$densite_br_plot <- renderPlot({
+  validate(need(length(input$modeles) > 0, "Sélectionnez au moins un modèle."))
+  plot_influence_surface(
+    error_long(),
+    surface_label = "Bande de roulement (BR)",
+    variable = "Moy_pond_densite_point",
+    breaks = dens_breaks,
+    labels = dens_labels,
+    mids = dens_mids,
+    titre = "Influence de la densité de points sol sur l'erreur de largeur",
+    xlab = "Classes de densité moyenne de points"
+  )
+}, res = 120)
+
+output$pente_pl_plot <- renderPlot({
+  validate(need(length(input$modeles) > 0, "Sélectionnez au moins un modèle."))
+  plot_influence_surface(
+    error_long(),
+    surface_label = "Plateforme (PL)",
+    variable = "Moy_pond_pente_versant",
+    breaks = pente_breaks,
+    labels = pente_labels,
+    mids = pente_mids,
+    titre = "Influence de la pente du versant sur l'erreur de largeur",
+    xlab = "Classes de pente du versant (%)"
+  )
+}, res = 120)
+
+output$pente_br_plot <- renderPlot({
+  validate(need(length(input$modeles) > 0, "Sélectionnez au moins un modèle."))
+  plot_influence_surface(
+    error_long(),
+    surface_label = "Bande de roulement (BR)",
+    variable = "Moy_pond_pente_versant",
+    breaks = pente_breaks,
+    labels = pente_labels,
+    mids = pente_mids,
+    titre = "Influence de la pente du versant sur l'erreur de largeur",
+    xlab = "Classes de pente du versant (%)"
+  )
+}, res = 120)
+
+output$orn_pl_plot <- renderPlot({
+  validate(need(length(input$modeles) > 0, "Sélectionnez au moins un modèle."))
+  plot_influence_surface(
+    error_long(),
+    surface_label = "Plateforme (PL)",
+    variable = "ornierage_cm",
+    breaks = orn_breaks,
+    labels = orn_labels,
+    mids = orn_mids,
+    titre = "Influence de l'orniérage sur l'erreur de largeur",
+    xlab = "Classes d'orniérage (cm)"
+  )
+}, res = 120)
+
+output$orn_br_plot <- renderPlot({
+  validate(need(length(input$modeles) > 0, "Sélectionnez au moins un modèle."))
+  plot_influence_surface(
+    error_long(),
+    surface_label = "Bande de roulement (BR)",
+    variable = "ornierage_cm",
+    breaks = orn_breaks,
+    labels = orn_labels,
+    mids = orn_mids,
+    titre = "Influence de l'orniérage sur l'erreur de largeur",
+    xlab = "Classes d'orniérage (cm)"
+  )
+}, res = 120)
+
+# Histogrammes -----------------------------------------------------------
+output$hist_bdtopo_plot <- renderPlot({
+  plot_hist_metric(
+    filtered_data(),
+    var = "ecart_bdtopo_centreBR_cm",
+    titre = "Répartition des écarts entre BDTopo et centre de la bande de roulement",
+    xlab = "Écart BDTopo ↔ centre BR (cm)"
+  )
+}, res = 120)
+
+output$hist_bary_plot <- renderPlot({
+  plot_hist_metric(
+    filtered_data(),
+    var = "Ecart_distbaryc_terrain_vs_gps_cm",
+    titre = "Répartition des écarts entre barycentre calculé et centre de la bande de roulement",
+    xlab = "Écart barycentre ↔ centre BR (cm)"
+  )
+}, res = 120)
+
+# Export PDF -------------------------------------------------------------
+output$download_pdf <- downloadHandler(
+  filename = function() {
+    paste0("Qualiroad_FireAccess_", format(Sys.Date(), "%Y%m%d"), ".pdf")
+  },
+  content = function(file) {
+    df <- filtered_data()
+    validate(need(nrow(df) > 0, "Aucune donnée à exporter après filtrage."))
+
+    tryCatch(
+      build_pdf_export(
+        df_filtered = df,
+        modeles = input$modeles,
+        ref_surface = input$type_ref,
+        output_file = file
+      ),
+      error = function(e) {
+        stop(
+          paste0(
+            "Export PDF impossible : ", e$message,
+            "\nVérifiez la présence de pagedown et de Chrome/Edge/Chromium sur la machine de déploiement."
+          )
+        )
+      }
+    )
+  }
+)
+```
